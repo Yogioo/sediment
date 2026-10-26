@@ -35,7 +35,7 @@
     baseP: 0.5,
     pulseEvery: 8,
     overloadMult: 3,
-    overloadEntropy: 1.6,
+    overloadEntropy: 4.0,   // 过载自己供油，不再依赖玩家失误
     meltTemp: 160,
     meltEntropy: 6,
     meltPenaltySec: 24,
@@ -109,9 +109,9 @@
       if (choice === "vent") { s.S = 0; s.T = CFG.ventTemp; }
       else if (choice === "divert") { s.S = Math.max(0, s.S - 1); }
     } else {
+      // 选错只亏产出，不涨熵。否则"故意选错"反而是熵泵的燃料，激励就反了。
       gain = p.batch * CFG.wrongPenalty;
       s.stats.wrong++;
-      s.S += 1;
     }
     s.res += gain; s.total += gain;
     s.pendingPulse = null;
@@ -143,6 +143,7 @@
       // 炸毁条件：熵失控（不是温度）。温度只在装了冷凝器时才是威胁
       // 熵高 = 设备受损：Q 持续下降。熵泵把 S 压住，就不会触发这条
       if (s.S > 1) s.Q = Math.max(0.15, s.Q - dt * 0.014 * (s.S - 1));
+      else if (s.Q < CFG.baseQ) s.Q = Math.min(CFG.baseQ, s.Q + dt * 0.020);   // 自修复
       if (s.S >= CFG.meltEntropy && s.meltT <= 0) {
         s.meltT = CFG.meltPenaltySec;
         s.stats.meltdowns++;
@@ -263,18 +264,25 @@
     if (!n || !this.canBuy(n)) return false;
     this.s.res -= n.cost;
     this.s.equipped[id] = true;
-    if (id === "distill") S.applyDistill(this.s);
+    if (id === "distill" || id === "recycle") S.applyDistill(this.s);   // recycle 会改变蒸馏的收敛结果
     this.gainText.push({ txt: "解锁 " + n.nm, t: 1.6, c: "#7fe3a8" });
     return true;
   };
 
   Game.prototype.choose = function (choice) {
     if (!this.s.pendingPulse) return false;
+    var p = this.s.pendingPulse;
+    var batch = p.batch;                       // 必须先存下来，结算后 pendingPulse 会被置空
+    var ideal = p.ideal;
     var before = this.s.total;
     S.resolvePulse(this.s, choice);
     var got = this.s.total - before;
-    var right = got > this.s.pendingPulse ? "#ffd24a" : "#e8564f";
-    this.gainText.push({ txt: (got > 0 ? "+" : "") + got.toFixed(1), t: 1.0, c: right });
+    var right = (choice === ideal);
+    this.gainText.push({
+      txt: (right ? "+" + got.toFixed(1) : "✗ 只剩 " + got.toFixed(1) + "（−60%）"),
+      t: right ? 1.0 : 1.4,
+      c: right ? "#ffd24a" : "#ff5c6e"
+    });
     this.tapFlash = 1;
     return true;
   };
@@ -300,6 +308,7 @@
         this.s.total = d.total || 0;
         this.s.equipped = d.equipped || {};
         this.s.Q = d.Q || 1; this.s.P = d.P || 0.5;
+        if (this.s.equipped.distill) S.applyDistill(this.s);   // 读档后也要按已装的机制重算
         this.s.S = d.S || 0; this.s.pumpBonus = d.pumpBonus || 0;
         var hours = Math.max(0, (Date.now() - (d.at || Date.now())) / 3600000);
         if (hours > 0.02) {
@@ -421,8 +430,9 @@
     var p = s.pendingPulse;
     g.textAlign = "left";
     if (p) {
-      var tag = p.impure ? "带杂质 → 该拐" : (p.hot ? "热峰 → 该拐" : "成色正常");
-      if (s.S >= 4) tag = "熵过高 → 该炸";
+      // 只报成分，不报该按哪个键。判断必须由玩家自己做。
+      var tag = p.impure ? "成分：带杂质" : (p.hot ? "成分：热峰" : "成分：正常");
+      if (s.S >= 4) tag = "熵过高";
       g.fillStyle = "rgba(255,240,200,0.95)";
       g.font = "800 15px -apple-system,Segoe UI,Roboto,sans-serif";
       g.fillText("一股料到闸口  " + p.batch.toFixed(1), 18, 182);
