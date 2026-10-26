@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0a0f13">
+<title>沉淀 · 判流</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#06090c;overflow:hidden;
+    -webkit-tap-highlight-color:transparent;touch-action:none;
+    font-family:-apple-system,"Segoe UI","Microsoft YaHei",Roboto,sans-serif}
+  #stage{display:flex;align-items:center;justify-content:center;height:100%}
+  #game{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" width="400" height="720"></canvas></div>
+<script>
+/* ==== src/sim.js ==== */
+/* ==========================================================================
+   沉淀 · 判流（最小切片核心模拟，无渲染）
+   机制（5 个）：
+     distill  蒸馏塔：把混合流切成「纯流 P=1, Q×0.85」+「渣流 Q×0.15」
+     recycle  回流阀：允许渣流回环，流量 −12%/圈
+     overload 过载许可：倍率 ×3，但每脉冲熵 +1.6，且失去温度保护
+     pump     熵泵：把熵当燃料吃，熵 >1 的部分被消耗并转成倍率
+     thermo   恒温阀：T 超阈值自动泄压（自动判定）
+   判流：每 8 秒一股脉冲，读 4 个读数（Q/P/T/S），选 放/拐/炸
+   ========================================================================== */
+(function (root) {
+  "use strict";
+
+  var CFG = {
+    baseQ: 1.0,
+    baseP: 0.5,
+    pulseEvery: 8,
+    overloadMult: 3,
+    overloadEntropy: 1.6,
+    meltTemp: 160,
+    meltEntropy: 6,
+    meltPenaltySec: 24,
+    ventTemp: 25,
+    pumpConsume: 2.0,     // 每秒吃掉多少熵
+    pumpMult: 0.33,        // 每吃掉 1 点熵 → 倍率 +0.30
+    pumpMultCap: 1.6,
+    distillPureQ: 0.85,
+    distillWasteQ: 0.15,
+    recycleLoss: 0.12,
+    wrongPenalty: 0.40,    // 判流选错：只拿到 40%
+    rightBonus: 1.15
+  };
+
+  function newState(opts) {
+    return {
+      t: 0, res: 0, total: 0,
+      Q: CFG.baseQ, P: CFG.baseP, T: CFG.ventTemp, S: 0,
+      mult: 1, pumpBonus: 0,
+      meltT: 0,
+      rand: opts && opts.seed ? (function (seed) {
+        var x = seed >>> 0 || 1;
+        return function () { x ^= x << 13; x >>>= 0; x ^= x >> 17; x ^= x << 5; x >>>= 0; return x / 4294967296; };
+      })(opts.seed) : Math.random,               // 熔毁剩余时间
+      pulseT: CFG.pulseEvery,
+      pendingPulse: null,     // 等待玩家判流的那一股
+      log: [],
+      equipped: {},           // 已解锁机制
+      stats: { pulses: 0, right: 0, wrong: 0, meltdowns: 0 }
+    };
+  }
+
+  function prodRate(s) {
+    if (s.meltT > 0) return 0;
+    var pump = 1 + s.pumpBonus;
+    return s.Q * s.P * s.mult * pump;
+  }
+
+  /* 一根脉冲到达：生成这一股料，等待判定 */
+  /* 每股脉冲有自己的成分：可能带杂质、可能带热峰。读数会变，判断才有意义 */
+  function makePulse(s) {
+    var batch = prodRate(s) * CFG.pulseEvery;
+    var r = s.rand ? s.rand() : Math.random();
+    var impure = r < 0.34;                  // 34% 带杂质
+    var hot = !impure && r > 0.78;          // 22% 带热峰
+    var ideal;
+    if (s.S >= 4) ideal = "vent";
+    else if (impure) ideal = "divert";      // 杂质 → 拐进旁路
+    else if (hot || s.T >= 110) ideal = "divert";
+    else ideal = "release";
+    return {
+      batch: batch, ideal: ideal, impure: impure, hot: hot,
+      readings: {
+        Q: s.Q,
+        P: impure ? Math.max(0.05, s.P * 0.35) : s.P,
+        T: hot ? s.T + 55 : s.T,
+        S: s.S
+      }
+    };
+  }
+
+  /* 玩家判流：choice = release | divert | vent */
+  function resolvePulse(s, choice) {
+    var p = s.pendingPulse;
+    if (!p) return 0;
+    s.stats.pulses++;
+    var gain;
+    if (choice === p.ideal) {
+      gain = p.batch * CFG.rightBonus;
+      s.stats.right++;
+      if (choice === "vent") { s.S = 0; s.T = CFG.ventTemp; }
+      else if (choice === "divert") { s.S = Math.max(0, s.S - 1); }
+    } else {
+      gain = p.batch * CFG.wrongPenalty;
+      s.stats.wrong++;
+      s.S += 1;
+    }
+    s.res += gain; s.total += gain;
+    s.pendingPulse = null;
+    s.pulseT = CFG.pulseEvery;
+    return gain;
+  }
+
+  /* 自动判定（恒温阀 / 离线托管）：按读数自动选 */
+  function autoChoose(s) {
+    var p = s.pendingPulse;
+    if (s.S >= 4) return "vent";
+    if (p && p.impure) return "divert";
+    if (p && p.hot) return "divert";
+    if (s.T >= 110) return "divert";
+    return "release";
+  }
+
+  function step(s, dt) {
+    s.t += dt;
+
+    /* 熔毁惩罚 */
+    if (s.meltT > 0) { s.meltT -= dt; }
+
+    /* 机制：过载 → 熵持续增长；否则缓慢自净 */
+    if (s.equipped.overload) {
+      s.mult = CFG.overloadMult;             // 过载的 3 倍率（之前漏了）
+      s.T += dt * 9;                        // 过载发热
+      s.S += dt * CFG.overloadEntropy / CFG.pulseEvery;
+      // 炸毁条件：熵失控（不是温度）。温度只在装了冷凝器时才是威胁
+      // 熵高 = 设备受损：Q 持续下降。熵泵把 S 压住，就不会触发这条
+      if (s.S > 1) s.Q = Math.max(0.15, s.Q - dt * 0.014 * (s.S - 1));
+      if (s.S >= CFG.meltEntropy && s.meltT <= 0) {
+        s.meltT = CFG.meltPenaltySec;
+        s.stats.meltdowns++;
+        s.S = 0;
+        s.Q = Math.max(0.15, s.Q * 0.45);
+      }
+    } else {
+      s.T += (CFG.ventTemp - s.T) * dt * 0.5;
+      s.S = Math.max(0, s.S - dt * 0.25);
+    }
+
+    /* 机制：恒温阀 → T 超阈值自动泄压（代价：按超温比例丢料） */
+    if (s.equipped.thermo && s.T > 120) {
+      var over = (s.T - 120) / 80;
+      s.T = 120;
+      s.Q = Math.max(0.2, s.Q * (1 - 0.12 * over));
+    }
+
+    /* 机制：熵泵 → 吃掉熵换倍率 */
+    if (s.equipped.pump) {
+      var eat = Math.min(Math.max(0, s.S - 1), CFG.pumpConsume * dt);
+      if (eat > 0) {
+        s.S -= eat;
+        s.pumpBonus = Math.min(CFG.pumpMultCap, s.pumpBonus + eat * CFG.pumpMult);
+      } else {
+        s.pumpBonus = Math.max(0, s.pumpBonus - dt * 0.05);
+      }
+    }
+
+    /* 产出 */
+    var gain = prodRate(s) * dt;
+    s.res += gain; s.total += gain;
+
+    /* 脉冲计时 */
+    if (!s.pendingPulse) {
+      s.pulseT -= dt;
+      if (s.pulseT <= 0) s.pendingPulse = makePulse(s);
+    }
+    return gain;
+  }
+
+  /* 蒸馏：把 P 拉满，Q 打折（有回流阀时渣流回环） */
+  function applyDistill(s) {
+    var pureQ = s.Q * CFG.distillPureQ;
+    var wasteQ = s.Q * CFG.distillWasteQ;
+    if (s.equipped.recycle) {
+      // 渣流回环：每圈损失 12%，几何收敛
+      var cur = wasteQ, extra = 0;
+      for (var i = 0; i < 12; i++) { cur *= (1 - CFG.recycleLoss); extra += cur * CFG.distillPureQ; cur *= CFG.distillPureQ; }
+      s.Q = pureQ + extra;
+    } else {
+      s.Q = pureQ;                 // 渣流被丢弃
+    }
+    s.P = 1;
+  }
+
+  /* 离线结算：η 由 build 决定，永远为正 */
+  function offlineEta(s) {
+    var eta = 0.70;
+    if (s.equipped.thermo) eta += 0.15;
+    if (s.equipped.pump) eta += 0.15;
+    if (s.S >= 6) eta *= 0.6;
+    return Math.max(0.55, Math.min(1.45, eta));
+  }
+
+  function settleOffline(s, hours, cfg) {
+    var rate = Math.max(0.5, prodRate(s));
+    var eta = offlineEta(s);
+    var gain = rate * eta * hours * 3600 * (1 + 0.05 * Math.log(1 + hours));
+    s.res += gain; s.total += gain;
+    return gain;
+  }
+
+  root.Sediment = {
+    CFG: CFG, newState: newState, step: step, prodRate: prodRate,
+    makePulse: makePulse, resolvePulse: resolvePulse, autoChoose: autoChoose,
+    applyDistill: applyDistill, offlineEta: offlineEta, settleOffline: settleOffline
+  };
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* ==== src/game.js ==== */
+/* 沉淀 · 判流 —— 可玩切片（5 机制 + 判流 + 离线 + 天赋树） */
+(function (root) {
+  "use strict";
+  var S = root.Sediment;
+  var W = 400, H = 720;
+
+  /* 天赋树（切片只放 5 个节点） */
+  var TREE = [
+    { id: "distill", nm: "蒸馏塔", cost: 30, req: [], desc: "把混合流切成纯流+渣流：纯度拉满，流量打折" },
+    { id: "recycle", nm: "回流阀", cost: 120, req: ["distill"], desc: "渣流接回头部成环（不产出，只改接线）" },
+    { id: "overload", nm: "过载许可", cost: 200, req: [], desc: "倍率 ×3，但熵持续上涨会烧坏设备" },
+    { id: "pump", nm: "熵泵", cost: 400, req: ["overload"], desc: "把熵当燃料吃掉，转成倍率" },
+    { id: "thermo", nm: "恒温阀", cost: 350, req: [], desc: "自动泄压，但每次都掉一点流量" }
+  ];
+
+  function Game(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.s = S.newState({ seed: (Date.now() % 100000) + 1 });
+    this.tree = TREE;
+    this.gainText = [];
+    this.offlineMsg = null;
+    this.tapFlash = 0;
+  }
+
+  Game.prototype.unlocked = function (id) { return !!this.s.equipped[id]; };
+
+  Game.prototype.canBuy = function (n) {
+    if (this.unlocked(n.id)) return false;
+    for (var i = 0; i < (n.req || []).length; i++) if (!this.unlocked(n.req[i])) return false;
+    return this.s.res >= n.cost;
+  };
+
+  Game.prototype.buy = function (id) {
+    var n = null;
+    for (var i = 0; i < this.tree.length; i++) if (this.tree[i].id === id) n = this.tree[i];
+    if (!n || !this.canBuy(n)) return false;
+    this.s.res -= n.cost;
+    this.s.equipped[id] = true;
+    if (id === "distill") S.applyDistill(this.s);
+    this.gainText.push({ txt: "解锁 " + n.nm, t: 1.6, c: "#7fe3a8" });
+    return true;
+  };
+
+  Game.prototype.choose = function (choice) {
+    if (!this.s.pendingPulse) return false;
+    var before = this.s.total;
+    S.resolvePulse(this.s, choice);
+    var got = this.s.total - before;
+    var right = got > this.s.pendingPulse ? "#ffd24a" : "#e8564f";
+    this.gainText.push({ txt: (got > 0 ? "+" : "") + got.toFixed(1), t: 1.0, c: right });
+    this.tapFlash = 1;
+    return true;
+  };
+
+  Game.prototype.update = function (dt) {
+    S.step(this.s, dt);
+    for (var i = this.gainText.length - 1; i >= 0; i--) {
+      this.gainText[i].t -= dt;
+      if (this.gainText[i].t <= 0) this.gainText.splice(i, 1);
+    }
+    if (this.tapFlash > 0) this.tapFlash -= dt * 3;
+  };
+
+  /* 离线：读档 + 结算 */
+  Game.prototype.boot = function () {
+    var raw = null;
+    try { raw = root.localStorage.getItem("sediment_save"); } catch (e) {}
+    if (raw) {
+      try {
+        var d = JSON.parse(raw);
+        this.s = S.newState({ seed: d.seed || 7 });
+        this.s.res = d.res || 0;
+        this.s.total = d.total || 0;
+        this.s.equipped = d.equipped || {};
+        this.s.Q = d.Q || 1; this.s.P = d.P || 0.5;
+        this.s.S = d.S || 0; this.s.pumpBonus = d.pumpBonus || 0;
+        var hours = Math.max(0, (Date.now() - (d.at || Date.now())) / 3600000);
+        if (hours > 0.02) {
+          var eta = S.offlineEta(this.s);
+          var gain = S.settleOffline(this.s, Math.min(hours, 24));
+          this.offlineMsg = { hours: hours, gain: gain, eta: eta };
+        }
+      } catch (e) {}
+    }
+  };
+
+  Game.prototype.save = function () {
+    var d = {
+      res: this.s.res, total: this.s.total, equipped: this.s.equipped,
+      Q: this.s.Q, P: this.s.P, S: this.s.S, pumpBonus: this.s.pumpBonus,
+      seed: 7, at: Date.now()
+    };
+    try { root.localStorage.setItem("sediment_save", JSON.stringify(d)); } catch (e) {}
+  };
+
+  root.SedGame = { Game: Game, TREE: TREE, C: { W: W, H: H } };
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* ==== src/render.js ==== */
+/* 沉淀 · 判流 —— 渲染 */
+(function (root) {
+  "use strict";
+  var G = root.SedGame, C = G.C, S = root.Sediment;
+  var W = C.W, H = C.H;
+
+  function rr(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+  }
+  function fmt(n) {
+    if (n < 1000) return Math.round(n).toString();
+    var u = ["K", "M", "B"], i = -1;
+    while (n >= 1000 && i < 2) { n /= 1000; i++; }
+    return (Math.round(n * 10) / 10) + u[i];
+  }
+
+  G.pulseRects = function () {
+    var w = (W - 36 - 16) / 3;
+    return [
+      { id: "release", nm: "放", x: 18, y: 322, w: w, h: 56, col: "#5fd08a" },
+      { id: "divert", nm: "拐", x: 18 + w + 8, y: 322, w: w, h: 56, col: "#ffd24a" },
+      { id: "vent", nm: "炸", x: 18 + (w + 8) * 2, y: 322, w: w, h: 56, col: "#ff7a5c" }
+    ];
+  };
+
+  G.cardRects = function () {
+    return G.TREE.map(function (n, i) {
+      return { id: n.id, x: 14, y: 396 + i * 60, w: W - 28, h: 54 };
+    });
+  };
+
+  G.Game.prototype.draw = function () {
+    var g = this.ctx, s = this.s;
+    g.clearRect(0, 0, W, H);
+
+    var bg = g.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#0e1418");
+    bg.addColorStop(0.5, "#0a0f13");
+    bg.addColorStop(1, "#06090c");
+    g.fillStyle = bg;
+    g.fillRect(0, 0, W, H);
+
+    /* 资源 */
+    g.textAlign = "left"; g.textBaseline = "middle";
+    g.fillStyle = "rgba(120,200,220,0.65)";
+    g.font = "700 11px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("沉淀 SEDIMENT", 18, 22);
+    g.fillStyle = "#e8f6ff";
+    g.font = "800 40px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText(fmt(s.res), 16, 54);
+    g.fillStyle = "rgba(120,220,170,0.9)";
+    g.font = "700 13px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("+" + S.prodRate(s).toFixed(2) + " /s", 18, 84);
+
+    if (s.mult > 1) {
+      g.fillStyle = "#ffd24a";
+      g.font = "800 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("过载 ×" + s.mult, 150, 84);
+    }
+
+    /* 四个读数 */
+    var gauges = [
+      { nm: "流量 Q", v: s.Q, max: 1.2, col: "#5cc8ff" },
+      { nm: "纯度 P", v: s.P, max: 1.0, col: "#7fe3a8" },
+      { nm: "温度 T", v: s.T, max: 200, col: "#ff9a5c" },
+      { nm: "熵 S", v: s.S, max: 8, col: "#c58bff" }
+    ];
+    var gw = (W - 36 - 24) / 4;
+    gauges.forEach(function (gg, i) {
+      var x = 18 + i * (gw + 8), y = 104, h = 46;
+      g.fillStyle = "rgba(255,255,255,0.04)";
+      rr(g, x, y, gw, h, 7); g.fill();
+      var pct = Math.max(0, Math.min(1, gg.v / gg.max));
+      var danger = (gg.nm[0] === "温" && gg.v > 120) || (gg.nm[0] === "熵" && gg.v > 4);
+      g.fillStyle = danger ? "#e8564f" : gg.col;
+      g.globalAlpha = 0.85;
+      rr(g, x + 3, y + h - 8, (gw - 6) * pct, 5, 2.5); g.fill();
+      g.globalAlpha = 1;
+      g.fillStyle = "rgba(200,225,240,0.6)";
+      g.font = "700 9px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.textAlign = "center";
+      g.fillText(gg.nm, x + gw / 2, y + 12);
+      g.fillStyle = danger ? "#ff8a7a" : "#dff0ff";
+      g.font = "800 13px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText(gg.v.toFixed(gg.nm[0] === "温" ? 0 : 2), x + gw / 2, y + 28);
+    });
+
+    /* 脉冲区 */
+    var p = s.pendingPulse;
+    g.textAlign = "left";
+    if (p) {
+      var tag = p.impure ? "带杂质 → 该拐" : (p.hot ? "热峰 → 该拐" : "成色正常");
+      if (s.S >= 4) tag = "熵过高 → 该炸";
+      g.fillStyle = "rgba(255,240,200,0.95)";
+      g.font = "800 15px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("一股料到闸口  " + p.batch.toFixed(1), 18, 182);
+      g.fillStyle = p.impure || p.hot || s.S >= 4 ? "#ffd24a" : "rgba(160,220,190,0.9)";
+      g.font = "700 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText(tag, 18, 204);
+
+      var rects = G.pulseRects();
+      for (var i = 0; i < rects.length; i++) {
+        var r = rects[i];
+        var gr = g.createLinearGradient(r.x, r.y, r.x, r.y + r.h);
+        gr.addColorStop(0, r.col);
+        gr.addColorStop(1, "rgba(20,30,25,0.9)");
+        g.fillStyle = gr;
+        rr(g, r.x, r.y, r.w, r.h, 12); g.fill();
+        g.fillStyle = "#0b1114";
+        g.font = "800 24px -apple-system,Segoe UI,Roboto,sans-serif";
+        g.textAlign = "center";
+        g.fillText(r.nm, r.x + r.w / 2, r.y + r.h / 2);
+      }
+      g.textAlign = "left";
+    } else {
+      var pctT = 1 - s.pulseT / S.CFG.pulseEvery;
+      g.fillStyle = "rgba(180,210,230,0.5)";
+      g.font = "700 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("下一股料 " + Math.max(0, s.pulseT).toFixed(1) + "s", 18, 190);
+      g.fillStyle = "rgba(255,255,255,0.07)";
+      rr(g, 18, 204, W - 36, 10, 5); g.fill();
+      g.fillStyle = "rgba(120,200,230,0.55)";
+      rr(g, 18, 204, (W - 36) * pctT, 10, 5); g.fill();
+      g.fillStyle = "rgba(150,190,215,0.35)";
+      g.font = "600 11px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("闸口在等料，先看天赋树", 18, 240);
+    }
+
+    /* 飘字 */
+    for (var f = 0; f < this.gainText.length; f++) {
+      var o = this.gainText[f];
+      g.globalAlpha = Math.min(1, o.t);
+      g.fillStyle = o.c;
+      g.font = "800 14px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.textAlign = "center";
+      g.fillText(o.txt, W / 2, 268 - (1.6 - o.t) * 12);
+      g.globalAlpha = 1;
+    }
+
+    /* 天赋树 */
+    g.textAlign = "left";
+    g.fillStyle = "rgba(255,200,120,0.85)";
+    g.font = "800 12px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("机制天赋树（花沉淀解锁）", 16, 376);
+
+    var cards = G.cardRects();
+    for (var c = 0; c < cards.length; c++) {
+      var card = cards[c];
+      var node = G.TREE[c];
+      var owned = this.unlocked(node.id);
+      var can = this.canBuy(node);
+
+      rr(g, card.x, card.y, card.w, card.h, 10);
+      g.fillStyle = owned ? "rgba(90,200,150,0.16)" : (can ? "rgba(90,160,230,0.18)" : "rgba(255,255,255,0.04)");
+      g.fill();
+      g.strokeStyle = owned ? "rgba(120,230,175,0.55)" : (can ? "rgba(150,210,255,0.55)" : "rgba(140,175,210,0.16)");
+      g.lineWidth = 1.2;
+      rr(g, card.x, card.y, card.w, card.h, 10);
+      g.stroke();
+
+      g.textAlign = "left";
+      g.fillStyle = owned ? "#a8f0c8" : (can ? "#eaf6ff" : "rgba(210,228,242,0.6)");
+      g.font = "800 13px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText(node.nm, card.x + 12, card.y + 18);
+      g.fillStyle = "rgba(190,215,235,0.55)";
+      g.font = "600 9.5px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText(node.desc, card.x + 12, card.y + 34);
+
+      g.textAlign = "right";
+      g.font = "800 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      if (owned) { g.fillStyle = "#8fe0ad"; g.fillText("已解锁", card.x + card.w - 12, card.y + 26); }
+      else {
+        g.fillStyle = can ? "#ffd24a" : "rgba(200,215,230,0.35)";
+        g.fillText(node.cost + " 沉淀", card.x + card.w - 12, card.y + 26);
+      }
+    }
+
+    /* 底部 */
+    g.textAlign = "center";
+    g.fillStyle = "rgba(140,175,200,0.4)";
+    g.font = "600 10px -apple-system,Segoe UI,Roboto,sans-serif";
+    g.fillText("关掉页面也会继续沉淀（离线按 70%+ 效率结算）", W / 2, H - 12);
+
+    /* 离线弹窗 */
+    if (this.offlineMsg) {
+      var m = this.offlineMsg;
+      g.fillStyle = "rgba(4,8,12,0.88)";
+      g.fillRect(0, 0, W, H);
+      g.textAlign = "center";
+      g.fillStyle = "#ffd24a";
+      g.font = "800 22px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("你离开了 " + m.hours.toFixed(1) + " 小时", W / 2, H / 2 - 60);
+      g.fillStyle = "#eaf6ff";
+      g.font = "800 30px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("+" + fmt(m.gain) + " 沉淀", W / 2, H / 2 - 12);
+      g.fillStyle = "rgba(190,220,240,0.7)";
+      g.font = "600 12px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("离线效率 η = " + m.eta.toFixed(2) + "（由你的机制决定）", W / 2, H / 2 + 22);
+      g.fillStyle = "rgba(255,255,255,0.5)";
+      g.font = "600 11px -apple-system,Segoe UI,Roboto,sans-serif";
+      g.fillText("点任意处继续", W / 2, H / 2 + 66);
+    }
+  };
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* ==== src/main.js ==== */
+/* 沉淀 · 判流 —— 启动 / 输入 */
+(function (root) {
+  "use strict";
+  var G = root.SedGame, C = G.C;
+  var W = C.W, H = C.H;
+
+  var game = null, last = 0, saveAcc = 0;
+
+  function boot() {
+    var canvas = root.document.getElementById("game");
+    game = new G.Game(canvas);
+    game.boot();
+    fit(canvas);
+    root.addEventListener("resize", function () { fit(canvas); });
+    canvas.addEventListener("pointerdown", onDown);
+    root.addEventListener("visibilitychange", function () { if (game) game.save(); });
+    last = Date.now();
+    loop();
+  }
+
+  function fit(canvas) {
+    var vw = root.innerWidth || W, vh = root.innerHeight || H;
+    var s = Math.min(vw / W, vh / H);
+    canvas.style.width = Math.round(W * s) + "px";
+    canvas.style.height = Math.round(H * s) + "px";
+    canvas._rect = null;
+  }
+
+  function toLocal(e) {
+    var cv = root.document.getElementById("game");
+    if (!cv._rect) cv._rect = cv.getBoundingClientRect();
+    var r = cv._rect;
+    return { x: (e.clientX - r.left) / (r.width / W), y: (e.clientY - r.top) / (r.height / H) };
+  }
+
+  function onDown(e) {
+    e.preventDefault();
+    var p = toLocal(e);
+
+    if (game.offlineMsg) { game.offlineMsg = null; return; }
+
+    if (game.s.pendingPulse) {
+      var pr = G.pulseRects();
+      for (var i = 0; i < pr.length; i++) {
+        var r = pr[i];
+        if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) {
+          game.choose(r.id);
+          return;
+        }
+      }
+    }
+
+    var cards = G.cardRects();
+    for (var c = 0; c < cards.length; c++) {
+      var card = cards[c];
+      if (p.x >= card.x && p.x <= card.x + card.w && p.y >= card.y && p.y <= card.y + card.h) {
+        game.buy(card.id);
+        return;
+      }
+    }
+  }
+
+  function loop() {
+    var now = Date.now();
+    var dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    game.update(dt);
+    game.draw();
+    saveAcc += dt;
+    if (saveAcc > 5) { saveAcc = 0; game.save(); }
+    root.requestAnimationFrame(loop);
+  }
+
+  root.API = {
+    g: function () { return game; },
+    step: function (n, dt) {
+      dt = dt || 1 / 60;
+      for (var i = 0; i < (n || 1); i++) game.update(dt);
+      game.draw();
+      return this.info();
+    },
+    choose: function (c) { return game.choose(c); },
+    buy: function (id) { return game.buy(id); },
+    info: function () {
+      var s = game.s;
+      return {
+        res: Math.round(s.res * 10) / 10,
+        rate: Math.round(root.Sediment.prodRate(s) * 100) / 100,
+        Q: Math.round(s.Q * 100) / 100, P: Math.round(s.P * 100) / 100,
+        T: Math.round(s.T), S: Math.round(s.S * 10) / 10,
+        mult: s.mult,
+        pending: !!s.pendingPulse,
+        unlocked: Object.keys(s.equipped),
+        pulses: s.stats.pulses, right: s.stats.right, wrong: s.stats.wrong,
+        meltdowns: s.stats.meltdowns,
+        t: Math.round(s.t)
+      };
+    }
+  };
+
+  if (root.document.readyState === "loading") {
+    root.document.addEventListener("DOMContentLoaded", boot);
+  } else boot();
+})(typeof window !== "undefined" ? window : globalThis);
+
+</script>
+</body>
+</html>
